@@ -4,23 +4,22 @@
 #include <cuda_runtime.h>
 
 #ifndef MIN
-#define MIN( x , y ) (((x) < (y)) ? (x) : (y))
+#define MIN(x, y) (((x) < (y)) ? (x) : (y))
 #endif
 
 #ifndef MAX
-#define MAX( x , y ) (((x) > (y)) ? (x) : (y))
+#define MAX(x, y) (((x) > (y)) ? (x) : (y))
 #endif
 
-// structure used to accumulate the number of elements, min, max, 
+// structure used to accumulate the number of elements, min, max,
 // sum and squared sum values accumulated until that point
-template <typename T_mid>
 struct intermediateStatsData
 {
 	unsigned int num_elems;
-	T_mid min;
-	T_mid max;
-	T_mid sum;
-	T_mid sq_sum;
+	double min;
+	double max;
+	double sum;
+	double sq_sum;
 
 	// initialize to the identity element
 	__host__ __device__ __forceinline__ void initialize()
@@ -33,16 +32,15 @@ struct intermediateStatsData
 };
 
 // structure to store final statistical results
-template <typename T_out>
 struct finalStatsData
 {
 	unsigned int num_elems;
-	T_out min;
-	T_out max;
-	T_out sum;
-	T_out mean;
-	T_out variance;
-	T_out std_dev;
+	double min;
+	double max;
+	double sum;
+	double mean;
+	double variance;
+	double std_dev;
 
 	// initialize to the identity element
 	__host__ __device__ __forceinline__ void initialize()
@@ -56,26 +54,25 @@ struct finalStatsData
 
 // convertToIntermediateStatsData is a function that takes in a value x and
 // returns an intermediateStatsData used while accumulating sum and squared sum values
-template <typename T_in, typename T_mid>
-__host__ __device__ __forceinline__ intermediateStatsData<T_mid> convertToIntermediateStatsData(const T_in& x)
+template <typename T_in>
+__host__ __device__ __forceinline__ intermediateStatsData convertToIntermediateStatsData(const T_in &x)
 {
-	intermediateStatsData<T_mid> result;
+	intermediateStatsData result;
 	result.num_elems = 1;
 	result.min = x;
 	result.max = x;
 	result.sum = x;
-	result.sq_sum = (T_mid)x * x;
+	result.sq_sum = (double)x * x;
 
 	return result;
 };
 
 // intermediateStatsDataBinaryOp is a function that accepts
 // two intermediateStatsData structs and returns their combination
-template <typename T_mid>
-__host__ __device__ __forceinline__ intermediateStatsData<T_mid>
-	intermediateStatsDataBinaryOp(const intermediateStatsData<T_mid>& x, const intermediateStatsData <T_mid>& y)
+__host__ __device__ __forceinline__ intermediateStatsData
+intermediateStatsDataBinaryOp(const intermediateStatsData &x, const intermediateStatsData &y)
 {
-	intermediateStatsData<T_mid> result;
+	intermediateStatsData result;
 	result.num_elems = x.num_elems + y.num_elems;
 	result.min = MIN(x.min, y.min);
 	result.max = MAX(x.max, y.max);
@@ -86,10 +83,9 @@ __host__ __device__ __forceinline__ intermediateStatsData<T_mid>
 };
 
 // converts final intermediateStatsData to finalStatsData
-template <typename T_mid, typename T_out>
-__host__ __device__ __forceinline__ finalStatsData<T_out> convertToFinalStatsData(const intermediateStatsData<T_mid>& x)
+__host__ __device__ __forceinline__ finalStatsData convertToFinalStatsData(const intermediateStatsData &x)
 {
-	finalStatsData<T_out> result;
+	finalStatsData result;
 	result.num_elems = x.num_elems;
 	result.min = x.min;
 	result.max = x.max;

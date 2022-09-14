@@ -3,30 +3,21 @@
 #include <iostream>
 #include <iomanip>
 #include <vector>
-#include <numeric>
-#include <algorithm>
 #include <chrono>
 #include <thread>
 #include <atomic>
 #include <type_traits>
 #include <cuda_runtime.h>
 #include <thrust/host_vector.h>
-#include "../include/handler.cuh"
+#include <thrust/system/cuda/experimental/pinned_allocator.h>
+#include <thrust/device_vector.h>
+#include "../include/cuda_handler.cuh"
 #include "../include/stats_data.cuh"
 #include "../include/reduce.cuh"
 
 const int VECTOR_DIM = (int)(20e6); // number of elements in the vectors
 const int NUM_OF_VECTORS = 100;		// number of vectors
-
-extern const int MAX_THREADS = 128; // max number of threads per block in reduce kernel
-extern const int MAX_BLOCKS = 256;	// max number of blocks per grid in reduce kernel
-
-enum class reduceType
-{
-	INT_TO_FLOAT_TO_DOUBLE = 0,
-	FLOAT_TO_FLOAT_TO_DOUBLE = 1,
-	DOUBLE_TO_DOUBLE_TO_DOUBLE = 2
-};
+typedef double T_in;				// takes data in T_in datatype
 
 template <unsigned int NUM_OF_SLOTS>
 struct threadDataStruct
@@ -35,13 +26,14 @@ struct threadDataStruct
 	int turnCount;
 	int nr_vectors;
 	int nr_elems[NUM_OF_SLOTS];
-	void *host_vec[NUM_OF_SLOTS];
-	void *result[NUM_OF_SLOTS];
-	reduceType reduce_type[NUM_OF_SLOTS];
+	thrust::host_vector<T_in, thrust::cuda::experimental::pinned_allocator<T_in>> *host_vec[NUM_OF_SLOTS];
+	finalStatsData *result[NUM_OF_SLOTS];
 };
 
 template <unsigned int NUM_OF_SLOTS>
 void threadCPU(void *pvoidData, std::atomic<int> &shared_val);
+
+void printResults(thrust::host_vector<finalStatsData, thrust::cuda::experimental::pinned_allocator<finalStatsData>> &result);
 
 void kernel(void)
 {
@@ -50,115 +42,45 @@ void kernel(void)
 
 	try
 	{
-		typedef double T_in;  // takes data in T_in datatype
-		typedef double T_mid; // makes calculations in T_mid datatype
-		typedef double T_out; // produces results in T_out datatype
-
-		// Vector dimensions
-		int nr_elems_A = VECTOR_DIM;
-
 		// Print program information
 		std::cout.precision(3);
 		std::cout << "Vector Statistics with Transform-Reduce Operation" << std::endl
-				  << "Calculates statistics of elements of " << NUM_OF_VECTORS << " vectors with " << (double)nr_elems_A << " elements." << std::endl;
+				  << "Calculates statistics of elements of " << NUM_OF_VECTORS << " vectors with " << (double)VECTOR_DIM << " double elements." << std::endl;
 
 		// Allocate and initialize the host vectors
-		thrust::host_vector<T_in> h_A[NUM_OF_VECTORS];
-		const T_in MAX_VALUE = 1e6;
+		thrust::host_vector<T_in, thrust::cuda::experimental::pinned_allocator<T_in>> h_A[NUM_OF_VECTORS];
+		const T_in MAX_VALUE = 1e3;
 		const T_in MIN_VALUE = 1.0;
 		srand((unsigned int)time(NULL));
 		for (int i = 0; i < NUM_OF_VECTORS; i++)
 		{
-			h_A[i] = thrust::host_vector<T_in>(nr_elems_A);
-			for (int j = 0; j < nr_elems_A; j++)
-			{
-				h_A[i][j] = ((T_in)rand() / RAND_MAX) * (i + 1) * (MAX_VALUE - MIN_VALUE) + MIN_VALUE + i;
-			}
+			h_A[i] = thrust::host_vector<T_in, thrust::cuda::experimental::pinned_allocator<T_in>>(VECTOR_DIM);
+			for (int j = 0; j < VECTOR_DIM; j++)
+				h_A[i][j] = ((double)rand() / RAND_MAX) * (i + 1) * (MAX_VALUE - MIN_VALUE) + MIN_VALUE + i;
 		}
+		thrust::host_vector<finalStatsData, thrust::cuda::experimental::pinned_allocator<finalStatsData>> result(NUM_OF_VECTORS);
+		for (int i = 0; i < NUM_OF_VECTORS; i++)
+			result[i].initialize();
 
 		// Start time for CPU part
 		std::cout << std::endl
 				  << "Calculation by using CPU:" << std::endl;
 		std::chrono::steady_clock::time_point begin_cpu = std::chrono::steady_clock::now();
 
-		T_out mean[NUM_OF_VECTORS], var[NUM_OF_VECTORS], min[NUM_OF_VECTORS], max[NUM_OF_VECTORS];
-
 		for (int i = 0; i < NUM_OF_VECTORS; i++)
 		{
-			T_out sum = std::accumulate(h_A[i].begin(), h_A[i].end(), 0.0);
-			mean[i] = sum / nr_elems_A;
-			T_out accum = 0.0;
-			std::for_each(h_A[i].begin(), h_A[i].end(), [&](const T_in d)
-						  { accum += (d - mean[i]) * (d - mean[i]); });
-			var[i] = accum / (nr_elems_A - 1);
-			auto minmaxresult = std::minmax_element(h_A[i].begin(), h_A[i].end());
-			min[i] = *minmaxresult.first;
-			max[i] = *minmaxresult.second;
+			intermediateStatsData statData;
+			statData.initialize();
+			for (int j = 0; j < VECTOR_DIM; j++)
+				statData = intermediateStatsDataBinaryOp(statData, convertToIntermediateStatsData(h_A[i][j]));
+			result[i] = convertToFinalStatsData(statData);
 		}
 
 		// End time for CPU part
 		double time_cpu = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin_cpu).count();
 
 		// Print results for some signals
-		std::cout << "Vector No          : "
-				  << std::setw(10) << std::right << "0"
-				  << " |"
-				  << std::setw(10) << std::right << "1"
-				  << " |"
-				  << std::setw(10) << std::right << "2"
-				  << " |"
-				  << "\t...\t|"
-				  << std::setw(10) << std::right << NUM_OF_VECTORS - 3 << " |"
-				  << std::setw(10) << std::right << NUM_OF_VECTORS - 2 << " |"
-				  << std::setw(10) << std::right << NUM_OF_VECTORS - 1 << " |" << std::endl;
-		std::cout << "Number of Elements : "
-				  << std::setw(10) << std::right << nr_elems_A << " |"
-				  << std::setw(10) << std::right << nr_elems_A << " |"
-				  << std::setw(10) << std::right << nr_elems_A << " |"
-				  << "\t...\t|"
-				  << std::setw(10) << std::right << nr_elems_A << " |"
-				  << std::setw(10) << std::right << nr_elems_A << " |"
-				  << std::setw(10) << std::right << nr_elems_A << " |" << std::endl;
-		std::cout << "Minimum Value      : "
-				  << std::setw(10) << std::right << min[0] << " |"
-				  << std::setw(10) << std::right << min[1] << " |"
-				  << std::setw(10) << std::right << min[2] << " |"
-				  << "\t...\t|"
-				  << std::setw(10) << std::right << min[NUM_OF_VECTORS - 3] << " |"
-				  << std::setw(10) << std::right << min[NUM_OF_VECTORS - 2] << " |"
-				  << std::setw(10) << std::right << min[NUM_OF_VECTORS - 1] << " |" << std::endl;
-		std::cout << "Maximum Value      : "
-				  << std::setw(10) << std::right << max[0] << " |"
-				  << std::setw(10) << std::right << max[1] << " |"
-				  << std::setw(10) << std::right << max[2] << " |"
-				  << "\t...\t|"
-				  << std::setw(10) << std::right << max[NUM_OF_VECTORS - 3] << " |"
-				  << std::setw(10) << std::right << max[NUM_OF_VECTORS - 2] << " |"
-				  << std::setw(10) << std::right << max[NUM_OF_VECTORS - 1] << " |" << std::endl;
-		std::cout << "Mean Value         : "
-				  << std::setw(10) << std::right << mean[0] << " |"
-				  << std::setw(10) << std::right << mean[1] << " |"
-				  << std::setw(10) << std::right << mean[2] << " |"
-				  << "\t...\t|"
-				  << std::setw(10) << std::right << mean[NUM_OF_VECTORS - 3] << " |"
-				  << std::setw(10) << std::right << mean[NUM_OF_VECTORS - 2] << " |"
-				  << std::setw(10) << std::right << mean[NUM_OF_VECTORS - 1] << " |" << std::endl;
-		std::cout << "Variance           : "
-				  << std::setw(10) << std::right << var[0] << " |"
-				  << std::setw(10) << std::right << var[1] << " |"
-				  << std::setw(10) << std::right << var[2] << " |"
-				  << "\t...\t|"
-				  << std::setw(10) << std::right << var[NUM_OF_VECTORS - 3] << " |"
-				  << std::setw(10) << std::right << var[NUM_OF_VECTORS - 2] << " |"
-				  << std::setw(10) << std::right << var[NUM_OF_VECTORS - 1] << " |" << std::endl;
-		std::cout << "Standard Deviation : "
-				  << std::setw(10) << std::right << std::sqrt(var[0]) << " |"
-				  << std::setw(10) << std::right << std::sqrt(var[1]) << " |"
-				  << std::setw(10) << std::right << std::sqrt(var[2]) << " |"
-				  << "\t...\t|"
-				  << std::setw(10) << std::right << std::sqrt(var[NUM_OF_VECTORS - 3]) << " |"
-				  << std::setw(10) << std::right << std::sqrt(var[NUM_OF_VECTORS - 2]) << " |"
-				  << std::setw(10) << std::right << std::sqrt(var[NUM_OF_VECTORS - 1]) << " |" << std::endl;
+		printResults(result);
 
 		// Print elapsed time for CPU part
 		std::cout << "Time elapsed with CPU = " << time_cpu << " sec." << std::endl;
@@ -167,11 +89,7 @@ void kernel(void)
 		int deviceCount;
 		CHECK_CUDA_ERROR(cudaGetDeviceCount(&deviceCount));
 		if (deviceCount < 1)
-		{
-			std::cerr << std::endl
-					  << "No CUDA Device found!" << std::endl;
-			exit(EXIT_FAILURE);
-		}
+			throw std::runtime_error("No CUDA Device found!");
 		// Uncomment below line do deactivate usage of multiple GPUs
 		// deviceCount = 1;
 		std::cout << std::endl
@@ -182,27 +100,36 @@ void kernel(void)
 			CHECK_CUDA_ERROR(cudaGetDeviceProperties(&prop, i));
 			std::cout << prop.name << ", ";
 			if ((MAX_THREADS > prop.maxThreadsDim[0]) || (MAX_BLOCKS > prop.maxGridSize[0]))
-			{
-				std::cerr << std::endl
-						  << "Required number of threads or blocks is too large for the device!" << std::endl;
-				exit(EXIT_FAILURE);
-			}
+				throw std::runtime_error("Required number of threads or blocks is too large for the device!");
 			if (prop.canMapHostMemory != 1)
-			{
-				std::cerr << std::endl
-						  << "Device can not map host memory!" << std::endl;
-				exit(EXIT_FAILURE);
-			}
+				throw std::runtime_error("Device can not map host memory!");
 			int hostRegSupported;
 			CHECK_CUDA_ERROR(cudaDeviceGetAttribute(&hostRegSupported, cudaDevAttrHostRegisterSupported, i));
 			if (hostRegSupported != 1)
-			{
-				std::cerr << std::endl
-						  << "Device does not support host memory registration!" << std::endl;
-				exit(EXIT_FAILURE);
-			}
+				throw std::runtime_error("Device does not support host memory registration!");
 		}
 		std::cout << "):" << std::endl;
+
+		// Reinitialize results vector
+		for (int i = 0; i < NUM_OF_VECTORS; i++)
+			result[i].initialize();
+
+		// Share the data among GPUs
+		const int NUM_OF_THREADS = deviceCount;
+		std::vector<threadDataStruct<NUM_OF_VECTORS>> threadData(NUM_OF_THREADS);
+		std::atomic<int> shared_val{0};
+		for (int i = 0; i < NUM_OF_THREADS; i++)
+		{
+			threadData[i].deviceID = i;
+			threadData[i].turnCount = (NUM_OF_VECTORS + 9) / 10;
+			threadData[i].nr_vectors = NUM_OF_VECTORS;
+			for (int j = 0; j < NUM_OF_VECTORS; j++)
+			{
+				threadData[i].nr_elems[j] = VECTOR_DIM;
+				threadData[i].host_vec[j] = &h_A[j];
+				threadData[i].result[j] = &result[j];
+			}
+		}
 
 		// Start time for GPU part
 		cudaEvent_t start, stop;
@@ -213,76 +140,14 @@ void kernel(void)
 		std::chrono::steady_clock::time_point begin_gpu = std::chrono::steady_clock::now();
 		CHECK_CUDA_ERROR(cudaSetDeviceFlags(cudaDeviceMapHost));
 
-		// Share the data among GPUs
-		const int NUM_OF_THREADS = 1;
-		std::vector<threadDataStruct<NUM_OF_VECTORS>> threadData(NUM_OF_THREADS);
-		std::atomic<int> shared_val{0};
-		finalStatsData<T_out> result[NUM_OF_VECTORS];
-		for (int i = 0; i < NUM_OF_VECTORS; i++)
-		{
-			result[i].initialize();
-		}
-		for (int i = 0; i < NUM_OF_THREADS; i++)
-		{
-			threadData[i].deviceID = i;
-			threadData[i].turnCount = 10;
-			threadData[i].nr_vectors = NUM_OF_VECTORS;
-			for (int j = 0; j < NUM_OF_VECTORS; j++)
-			{
-				threadData[i].nr_elems[j] = VECTOR_DIM;
-				threadData[i].host_vec[j] = (void *)thrust::raw_pointer_cast(h_A[j].data());
-				threadData[i].result[j] = result + j;
-				if ((std::is_same<T_in, int>::value) & (std::is_same<T_mid, float>::value) & (std::is_same<T_out, double>::value))
-				{
-					threadData[i].reduce_type[j] = reduceType::INT_TO_FLOAT_TO_DOUBLE;
-				}
-				else if ((std::is_same<T_in, float>::value) & (std::is_same<T_mid, float>::value) & (std::is_same<T_out, double>::value))
-				{
-					threadData[i].reduce_type[j] = reduceType::FLOAT_TO_FLOAT_TO_DOUBLE;
-				}
-				else if ((std::is_same<T_in, double>::value) & (std::is_same<T_mid, double>::value) & (std::is_same<T_out, double>::value))
-				{
-					threadData[i].reduce_type[j] = reduceType::DOUBLE_TO_DOUBLE_TO_DOUBLE;
-				}
-				else
-				{
-					std::cerr << std::endl
-							  << "Unidentified reduce type on vector no: " << j << "!" << std::endl;
-					exit(EXIT_FAILURE);
-				}
-			}
-		}
-		if (NUM_OF_THREADS > 1)
-			threadData[1].turnCount = 1;
-
-		// Pin host memory vectors
-		for (int i = 0; i < NUM_OF_VECTORS; i++)
-		{
-			CHECK_CUDA_ERROR(cudaHostRegister((void *)thrust::raw_pointer_cast(h_A[i].data()), VECTOR_DIM * sizeof(T_in),
-											  cudaHostRegisterMapped | cudaHostRegisterPortable));
-		}
-		CHECK_CUDA_ERROR(cudaHostRegister((void *)result, NUM_OF_VECTORS * sizeof(finalStatsData<T_out>),
-										  cudaHostRegisterMapped | cudaHostRegisterPortable));
-
 		// Execution on GPUs by using threads
 		std::vector<std::thread> threadVector;
 		for (int i = 1; i < NUM_OF_THREADS; i++)
-		{
 			threadVector.push_back(std::thread(threadCPU<NUM_OF_VECTORS>, &(threadData[i]), std::ref(shared_val)));
-		}
 		threadCPU<NUM_OF_VECTORS>(&(threadData[0]), std::ref(shared_val));
 		for (std::thread &th : threadVector)
-		{
 			if (th.joinable())
 				th.join();
-		}
-
-		// Unpin host memory vector
-		for (int i = 0; i < NUM_OF_VECTORS; i++)
-		{
-			CHECK_CUDA_ERROR(cudaHostUnregister((void *)thrust::raw_pointer_cast(h_A[i].data())));
-		}
-		CHECK_CUDA_ERROR(cudaHostUnregister((void *)result));
 
 		// End time for GPU part
 		CHECK_CUDA_ERROR(cudaEventRecord(stop, 0));
@@ -294,65 +159,7 @@ void kernel(void)
 		CHECK_CUDA_ERROR(cudaEventDestroy(stop));
 
 		// Print results for some signals
-		std::cout << "Vector No          : "
-				  << std::setw(10) << std::right << "0"
-				  << " |"
-				  << std::setw(10) << std::right << "1"
-				  << " |"
-				  << std::setw(10) << std::right << "2"
-				  << " |"
-				  << "\t...\t|"
-				  << std::setw(10) << std::right << NUM_OF_VECTORS - 3 << " |"
-				  << std::setw(10) << std::right << NUM_OF_VECTORS - 2 << " |"
-				  << std::setw(10) << std::right << NUM_OF_VECTORS - 1 << " |" << std::endl;
-		std::cout << "Number of Elements : "
-				  << std::setw(10) << std::right << result[0].num_elems << " |"
-				  << std::setw(10) << std::right << result[1].num_elems << " |"
-				  << std::setw(10) << std::right << result[2].num_elems << " |"
-				  << "\t...\t|"
-				  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 3].num_elems << " |"
-				  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 2].num_elems << " |"
-				  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 1].num_elems << " |" << std::endl;
-		std::cout << "Minimum Value      : "
-				  << std::setw(10) << std::right << result[0].min << " |"
-				  << std::setw(10) << std::right << result[1].min << " |"
-				  << std::setw(10) << std::right << result[2].min << " |"
-				  << "\t...\t|"
-				  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 3].min << " |"
-				  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 2].min << " |"
-				  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 1].min << " |" << std::endl;
-		std::cout << "Maximum Value      : "
-				  << std::setw(10) << std::right << result[0].max << " |"
-				  << std::setw(10) << std::right << result[1].max << " |"
-				  << std::setw(10) << std::right << result[2].max << " |"
-				  << "\t...\t|"
-				  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 3].max << " |"
-				  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 2].max << " |"
-				  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 1].max << " |" << std::endl;
-		std::cout << "Mean Value         : "
-				  << std::setw(10) << std::right << result[0].mean << " |"
-				  << std::setw(10) << std::right << result[1].mean << " |"
-				  << std::setw(10) << std::right << result[2].mean << " |"
-				  << "\t...\t|"
-				  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 3].mean << " |"
-				  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 2].mean << " |"
-				  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 1].mean << " |" << std::endl;
-		std::cout << "Variance           : "
-				  << std::setw(10) << std::right << result[0].variance << " |"
-				  << std::setw(10) << std::right << result[1].variance << " |"
-				  << std::setw(10) << std::right << result[2].variance << " |"
-				  << "\t...\t|"
-				  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 3].variance << " |"
-				  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 2].variance << " |"
-				  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 1].variance << " |" << std::endl;
-		std::cout << "Standard Deviation : "
-				  << std::setw(10) << std::right << result[0].std_dev << " |"
-				  << std::setw(10) << std::right << result[1].std_dev << " |"
-				  << std::setw(10) << std::right << result[2].std_dev << " |"
-				  << "\t...\t|"
-				  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 3].std_dev << " |"
-				  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 2].std_dev << " |"
-				  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 1].std_dev << " |" << std::endl;
+		printResults(result);
 
 		// Print elapsed time for GPU part
 		time_gpu /= 1e3f; // conversion from msec to sec
@@ -366,30 +173,21 @@ void kernel(void)
 	{
 		std::cerr << std::endl
 				  << "Thrust error (" << err.what() << ")!" << std::endl;
-		exit(EXIT_FAILURE);
 	}
 	catch (const std::bad_alloc &err)
 	{
 		std::cerr << std::endl
 				  << "Memory allocation error (" << err.what() << ")!" << std::endl;
-		exit(EXIT_FAILURE);
 	}
 	catch (const std::runtime_error &err)
 	{
 		std::cerr << std::endl
 				  << "Runtime error (" << err.what() << ")!" << std::endl;
-		exit(EXIT_FAILURE);
 	}
 
 	// cudaDeviceReset must be called before exiting in order for profiling and
 	// tracing tools such as Nsight and Visual Profiler to show complete traces.
-	int deviceCount;
-	CHECK_CUDA_ERROR(cudaGetDeviceCount(&deviceCount));
-	for (int i = 0; i < deviceCount; i++)
-	{
-		CHECK_CUDA_ERROR(cudaSetDevice(i));
-		CHECK_CUDA_ERROR(cudaDeviceReset());
-	}
+	RESET_CUDA_DEVICES();
 
 	// Print elapsed time for the program
 	double time_total = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin_total).count();
@@ -410,139 +208,48 @@ void threadCPU(void *pvoidData, std::atomic<int> &shared_val)
 	}
 
 	// Create streams
-	const int NUM_OF_STREAMS = 8;
+	const int NUM_OF_STREAMS = 100;
 	cudaStream_t stream[NUM_OF_STREAMS];
 	for (int i = 0; i < NUM_OF_STREAMS; i++)
-	{
 		CHECK_CUDA_ERROR(cudaStreamCreate(&stream[i]));
-	}
 
 	// Allocate the device vectors
-	void *d_A[NUM_OF_STREAMS];
+	thrust::device_vector<double> d_A[NUM_OF_STREAMS];
 	for (int i = 0; i < NUM_OF_STREAMS; i++)
-	{
-		CHECK_CUDA_ERROR(cudaMalloc(&d_A[i], VECTOR_DIM * sizeof(double)));
-	}
+		d_A[i] = thrust::device_vector<double>(VECTOR_DIM);
 
 	// Temporary storage variables for reduce operation
-	void *d_temp_storage[NUM_OF_STREAMS];
+	thrust::device_vector<intermediateStatsData> d_temp_storage[NUM_OF_STREAMS];
 	for (int i = 0; i < NUM_OF_STREAMS; i++)
-	{
-		CHECK_CUDA_ERROR(cudaMalloc(&d_temp_storage[i], MAX_BLOCKS * 2 * sizeof(intermediateStatsData<double>)));
-	}
+		d_temp_storage[i] = thrust::device_vector<intermediateStatsData>(MAX_BLOCKS * 2);
 
 	int turnCount = 0;
-	int val = shared_val.fetch_add(NUM_OF_STREAMS, std::memory_order_relaxed);
-	while (val < data->nr_vectors)
+	int curr_vec = shared_val.fetch_add(1, std::memory_order_relaxed);
+	int currStreamNo = 0;
+	while (curr_vec < data->nr_vectors)
 	{
 		// Copy host input vector to device
-		for (int i = 0; i < NUM_OF_STREAMS; i++)
-		{
-			int curr_vec = val + i;
-			if (curr_vec < data->nr_vectors)
-			{
-				size_t T_in_size;
-				if (data->reduce_type[curr_vec] == reduceType::INT_TO_FLOAT_TO_DOUBLE)
-				{
-					T_in_size = sizeof(int);
-				}
-				else if (data->reduce_type[curr_vec] == reduceType::FLOAT_TO_FLOAT_TO_DOUBLE)
-				{
-					T_in_size = sizeof(float);
-				}
-				else if (data->reduce_type[curr_vec] == reduceType::DOUBLE_TO_DOUBLE_TO_DOUBLE)
-				{
-					T_in_size = sizeof(double);
-				}
-				else
-				{
-					std::cerr << std::endl
-							  << "Unidentified reduce type on vector no: " << curr_vec << "!" << std::endl;
-					exit(EXIT_FAILURE);
-				}
-				CHECK_CUDA_ERROR(cudaMemcpyAsync(d_A[i], data->host_vec[curr_vec], data->nr_elems[curr_vec] * T_in_size,
-												 cudaMemcpyHostToDevice, stream[i]));
-			}
-			else
-			{
-				break;
-			}
-		}
+		CHECK_CUDA_ERROR(cudaMemcpyAsync(thrust::raw_pointer_cast(d_A[currStreamNo].data()), thrust::raw_pointer_cast(data->host_vec[curr_vec]->data()),
+										 data->nr_elems[curr_vec] * sizeof(T_in), cudaMemcpyHostToDevice, stream[currStreamNo]));
 
 		// Launch CUDA Kernel
-		for (int i = 0; i < NUM_OF_STREAMS; i++)
-		{
-			int curr_vec = val + i;
-			if (curr_vec < data->nr_vectors)
-			{
-				if (data->reduce_type[curr_vec] == reduceType::INT_TO_FLOAT_TO_DOUBLE)
-				{
-					getStatsFromData<int, float, double>(data->nr_elems[curr_vec], (int *)(d_A[i]),
-														 (intermediateStatsData<float> *)d_temp_storage[i], (finalStatsData<double> *)d_temp_storage[i], stream[i]);
-				}
-				else if (data->reduce_type[curr_vec] == reduceType::FLOAT_TO_FLOAT_TO_DOUBLE)
-				{
-					getStatsFromData<float, float, double>(data->nr_elems[curr_vec], (float *)(d_A[i]),
-														   (intermediateStatsData<float> *)d_temp_storage[i], (finalStatsData<double> *)d_temp_storage[i], stream[i]);
-				}
-				else if (data->reduce_type[curr_vec] == reduceType::DOUBLE_TO_DOUBLE_TO_DOUBLE)
-				{
-					getStatsFromData<double, double, double>(data->nr_elems[curr_vec], (double *)(d_A[i]),
-															 (intermediateStatsData<double> *)d_temp_storage[i], (finalStatsData<double> *)d_temp_storage[i], stream[i]);
-				}
-				else
-				{
-					std::cerr << std::endl
-							  << "Unidentified reduce type on vector no: " << curr_vec << "!" << std::endl;
-					exit(EXIT_FAILURE);
-				}
-			}
-			else
-			{
-				break;
-			}
-		}
+		getStatsFromData<T_in>(data->nr_elems[curr_vec], (T_in *)(thrust::raw_pointer_cast(d_A[currStreamNo].data())),
+							   (intermediateStatsData *)thrust::raw_pointer_cast(d_temp_storage[currStreamNo].data()),
+							   (finalStatsData *)thrust::raw_pointer_cast(d_temp_storage[currStreamNo].data()), stream[currStreamNo]);
 
 		// Copy device output vector to host
-		for (int i = 0; i < NUM_OF_STREAMS; i++)
-		{
-			int curr_vec = val + i;
-			if (curr_vec < data->nr_vectors)
-			{
-				size_t T_out_size;
-				if (data->reduce_type[curr_vec] == reduceType::INT_TO_FLOAT_TO_DOUBLE)
-				{
-					T_out_size = sizeof(finalStatsData<double>);
-				}
-				else if (data->reduce_type[curr_vec] == reduceType::FLOAT_TO_FLOAT_TO_DOUBLE)
-				{
-					T_out_size = sizeof(finalStatsData<double>);
-				}
-				else if (data->reduce_type[curr_vec] == reduceType::DOUBLE_TO_DOUBLE_TO_DOUBLE)
-				{
-					T_out_size = sizeof(finalStatsData<double>);
-				}
-				else
-				{
-					std::cerr << std::endl
-							  << "Unidentified reduce type on vector no: " << curr_vec << "!" << std::endl;
-					exit(EXIT_FAILURE);
-				}
-				CHECK_CUDA_ERROR(cudaMemcpyAsync(data->result[curr_vec], d_temp_storage[i], T_out_size,
-												 cudaMemcpyDeviceToHost, stream[i]));
-			}
-			else
-			{
-				break;
-			}
-		}
+		CHECK_CUDA_ERROR(cudaMemcpyAsync(data->result[curr_vec], thrust::raw_pointer_cast(d_temp_storage[currStreamNo].data()),
+										 sizeof(finalStatsData), cudaMemcpyDeviceToHost, stream[currStreamNo]));
 
-		if ((++turnCount % data->turnCount) == 0)
+		turnCount++;
+		if (turnCount >= data->turnCount)
 		{
 			CHECK_CUDA_ERROR(cudaDeviceSynchronize());
+			turnCount = 0;
 		}
 
-		val = shared_val.fetch_add(NUM_OF_STREAMS, std::memory_order_relaxed);
+		curr_vec = shared_val.fetch_add(1, std::memory_order_relaxed);
+		currStreamNo = (currStreamNo + 1) % NUM_OF_STREAMS;
 	}
 
 	// Synchronize and destroy streams, deallocate device vectors and temporary storage
@@ -550,9 +257,70 @@ void threadCPU(void *pvoidData, std::atomic<int> &shared_val)
 	{
 		CHECK_CUDA_ERROR(cudaStreamSynchronize(stream[i]));
 		CHECK_CUDA_ERROR(cudaStreamDestroy(stream[i]));
-		CHECK_CUDA_ERROR(cudaFree(d_A[i]));
-		CHECK_CUDA_ERROR(cudaFree(d_temp_storage[i]));
 	}
 
 	return;
+}
+
+void printResults(thrust::host_vector<finalStatsData, thrust::cuda::experimental::pinned_allocator<finalStatsData>> &result)
+{
+	std::cout << "Vector No          : "
+			  << std::setw(10) << std::right << "0"
+			  << " |"
+			  << std::setw(10) << std::right << "1"
+			  << " |"
+			  << std::setw(10) << std::right << "2"
+			  << " |"
+			  << "\t...\t|"
+			  << std::setw(10) << std::right << NUM_OF_VECTORS - 3 << " |"
+			  << std::setw(10) << std::right << NUM_OF_VECTORS - 2 << " |"
+			  << std::setw(10) << std::right << NUM_OF_VECTORS - 1 << " |" << std::endl;
+	std::cout << "Number of Elements : "
+			  << std::setw(10) << std::right << result[0].num_elems << " |"
+			  << std::setw(10) << std::right << result[1].num_elems << " |"
+			  << std::setw(10) << std::right << result[2].num_elems << " |"
+			  << "\t...\t|"
+			  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 3].num_elems << " |"
+			  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 2].num_elems << " |"
+			  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 1].num_elems << " |" << std::endl;
+	std::cout << "Minimum Value      : "
+			  << std::setw(10) << std::right << result[0].min << " |"
+			  << std::setw(10) << std::right << result[1].min << " |"
+			  << std::setw(10) << std::right << result[2].min << " |"
+			  << "\t...\t|"
+			  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 3].min << " |"
+			  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 2].min << " |"
+			  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 1].min << " |" << std::endl;
+	std::cout << "Maximum Value      : "
+			  << std::setw(10) << std::right << result[0].max << " |"
+			  << std::setw(10) << std::right << result[1].max << " |"
+			  << std::setw(10) << std::right << result[2].max << " |"
+			  << "\t...\t|"
+			  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 3].max << " |"
+			  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 2].max << " |"
+			  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 1].max << " |" << std::endl;
+	std::cout << "Mean Value         : "
+			  << std::setw(10) << std::right << result[0].mean << " |"
+			  << std::setw(10) << std::right << result[1].mean << " |"
+			  << std::setw(10) << std::right << result[2].mean << " |"
+			  << "\t...\t|"
+			  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 3].mean << " |"
+			  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 2].mean << " |"
+			  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 1].mean << " |" << std::endl;
+	std::cout << "Variance           : "
+			  << std::setw(10) << std::right << result[0].variance << " |"
+			  << std::setw(10) << std::right << result[1].variance << " |"
+			  << std::setw(10) << std::right << result[2].variance << " |"
+			  << "\t...\t|"
+			  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 3].variance << " |"
+			  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 2].variance << " |"
+			  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 1].variance << " |" << std::endl;
+	std::cout << "Standard Deviation : "
+			  << std::setw(10) << std::right << result[0].std_dev << " |"
+			  << std::setw(10) << std::right << result[1].std_dev << " |"
+			  << std::setw(10) << std::right << result[2].std_dev << " |"
+			  << "\t...\t|"
+			  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 3].std_dev << " |"
+			  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 2].std_dev << " |"
+			  << std::setw(10) << std::right << result[NUM_OF_VECTORS - 1].std_dev << " |" << std::endl;
 }
